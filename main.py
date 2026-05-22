@@ -2,260 +2,187 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-import os
+import math
 import random
-import pickle
 
 # =====================================================================
-# 0. ГЛОБАЛЬНАЯ КОНФИГУРАЦИЯ (МАСШТАБИРОВАНИЕ МОДЕЛИ)
+# 0. ГЛОБАЛЬНАЯ КОНФИГУРАЦИЯ (ИГРАЙТЕСЬ С ЭТИМИ ПАРАМЕТРАМИ ТУТ)
 # =====================================================================
-VOCAB_SIZE = 1000     # Размер BPE словаря
-EMBED_DIM = 256       # Ширина сети (Размерность скрытых векторов)
-NUM_LAYERS = 4        # Глубина сети (Количество слоев)
+DIRECTION = "backward"  # "forward" (прямая лесенка) или "backward" (Z-лесенка справа налево)
 
-SEQ_LEN = 64          # Контекстное окно в ТОКЕНАХ (64 токена ≈ 200 символов)
-BATCH_SIZE = 32       # Размер батча
-START_LR = 0.002      # Начальная скорость обучения
-ETA_MIN = 0.0001      # Минимальная скорость обучения
-EPOCHS = 5            # Количество эпох
+# Главный параметр, определяющий геометрию кубиков Лего!
+INPUT_WIDTH = 8         # Ширина входного вектора. Количество блоков автоматичеки станет (INPUT_WIDTH - 1)
 
-GEN_TEMPERATURE = 0.8 # Температура сэмплирования
-GEN_LENGTH = 60       # Длина генерируемого текста в ТОКЕНАХ
-
-INPUT_FILE = "input.txt"
-MODEL_PATH = "lego_bpe_z_gpt.pt"
-TOKENIZER_PATH = "bpe_tokenizer.pkl"
+BATCH_SIZE = 32
+EPOCHS = 20
+START_LR = 0.005
 
 
 # =====================================================================
-# 1. СТАБИЛЬНЫЙ BPE ТОКЕНИЗАТОР (БЕЗ ЗАВИСАНИЙ И С КОРРЕКТНЫМ ДЕКОДОМ)
+# 1. ГЕНЕРАЦИЯ ЧИСЛОВЫХ ДАННЫХ (Окно из N чисел -> 1 число в будущем)
 # =====================================================================
-class SimpleBPETokenizer:
-    def __init__(self, vocab_size):
-        self.vocab_size = vocab_size
-        self.merges = {}  # (int, int) -> int
-        self.vocab = {idx: bytes([idx]) for idx in range(256)}
-
-    def _get_stats(self, ids):
-        counts = {}
-        for pair in zip(ids, ids[1:]):
-            counts[pair] = counts.get(pair, 0) + 1
-        return counts
-
-    def _merge(self, ids, pair, idx):
-        new_ids = []
-        i = 0
-        while i < len(ids):
-            if i < len(ids) - 1 and (ids[i], ids[i+1]) == pair:
-                new_ids.append(idx)
-                i += 2
-            else:
-                new_ids.append(ids[i])
-                i += 1
-        return new_ids
-
-    def train(self, text):
-        print("Обучаю BPE-токенизатор на тексте...")
-        ids = list(text.encode("utf-8"))
-        num_merges = self.vocab_size - 256
+def generate_sliding_window_data(num_samples=2000, window_size=8):
+    X_list, Y_list = [], []
+    for _ in range(num_samples):
+        phase = random.uniform(0, 2 * math.pi)
+        trend = random.uniform(-0.01, 0.01)
         
-        for i in range(num_merges):
-            stats = self._get_stats(ids)
-            if not stats:
-                break
-            top_pair = max(stats, key=stats.get)
-            new_idx = 256 + i
-            ids = self._merge(ids, top_pair, new_idx)
-            self.merges[top_pair] = new_idx
-            self.vocab[new_idx] = self.vocab[top_pair[0]] + self.vocab[top_pair[1]]
+        full_series = []
+        for t in range(window_size + 1):
+            val = math.sin(0.4 * t + phase) + (trend * t) + random.normalvariate(0, 0.05)
+            full_series.append(val)
             
-    def encode(self, text):
-        ids = list(text.encode("utf-8"))
-        # Применяем слияния строго в том порядке, в котором они учились
-        for pair, idx in self.merges.items():
-            if len(ids) < 2:
-                break
-            ids = self._merge(ids, pair, idx)
-        return ids
-
-    def decode(self, ids):
-        text_bytes = b"".join(self.vocab.get(idx, b"") for idx in ids)
-        return text_bytes.decode("utf-8", errors="replace")
-
-
-# =====================================================================
-# 2. ПОДГОТОВКА ДАННЫХ
-# =====================================================================
-if not os.path.exists(INPUT_FILE):
-    print(f"Файл {INPUT_FILE} не найден. Создаю демо-корпус...")
-    demo_text = (
-        "критическое мышление в EdTech экосистеме развивает симулякры и масштабные тренды. "
-        "квадратный бежевый табурет стоял в углу. деревянное сочное кресло привлекало внимание бизнеса. "
-    ) * 1000
-    with open(INPUT_FILE, "w", encoding="utf-8") as f:
-        f.write(demo_text)
-
-with open(INPUT_FILE, "r", encoding="utf-8") as f:
-    raw_text = f.read()
-
-# Очищаем старые дефектные кэши
-if os.path.exists(TOKENIZER_PATH): os.remove(TOKENIZER_PATH)
-if os.path.exists(MODEL_PATH): os.remove(MODEL_PATH)
-
-tokenizer = SimpleBPETokenizer(vocab_size=VOCAB_SIZE)
-tokenizer.train(raw_text)
-with open(TOKENIZER_PATH, "wb") as f:
-    pickle.dump(tokenizer, f)
-
-data_indices = tokenizer.encode(raw_text)
-print(f"Размер исходного текста: {len(raw_text)} символов.")
-print(f"После BPE токенизации: {len(data_indices)} токенов (сжатие в {len(raw_text)/len(data_indices):.2f} раза!).")
-
-def get_z_bpe_batches(data, batch_size, seq_len):
-    num_chunks = len(data) // (seq_len + 1)
-    x_list, y_list = [], []
-    for i in range(num_chunks):
-        start_idx = i * (seq_len + 1)
-        chunk = data[start_idx : start_idx + seq_len + 1]
+        X_list.append(torch.tensor(full_series[:-1], dtype=torch.float32)) 
+        Y_list.append(torch.tensor([full_series[-1]], dtype=torch.float32)) 
         
-        # Каноничный Z-ход (разворачиваем токены задом наперед)
-        chunk = chunk[::-1]
-        
-        x_list.append(torch.tensor(chunk[:-1]))
-        y_list.append(torch.tensor(chunk[1:]))
-        
-        if len(x_list) == batch_size:
-            yield torch.stack(x_list), torch.stack(y_list)
-            x_list, y_list = [], []
+    return torch.stack(X_list), torch.stack(Y_list)
+
+# Генерируем выборки
+X_all, Y_all = generate_sliding_window_data(num_samples=1500, window_size=INPUT_WIDTH)
+train_size = 1200
+X_train, Y_train = X_all[:train_size], Y_all[:train_size]
+X_test, Y_test = X_all[train_size:], Y_all[train_size:]
+
+print(f"--- Статистика Истинной Лего-Топологии ---")
+print(f"Ширина входа: {INPUT_WIDTH}. Количество кубиков Лего в слое: {INPUT_WIDTH - 1}")
+print(f"Форма X_train: {X_train.shape} | Форма Y_train (скалярный прогноз): {Y_train.shape}\n")
 
 
 # =====================================================================
-# 3. АРХИТЕКТУРА LEGO-GPT (РЕКУРРЕНТНЫЙ КОНВЕЙЕР)
+# 2. ИСТИННАЯ ЛЕГО-ТОПОЛОГИЯ (ИСПРАВЛЕНА ИНДЕКСАЦИЯ MODULELIST)
 # =====================================================================
-class WideLegoBlock(nn.Module):
-    def __init__(self, embed_dim):
+class LegoBlock(nn.Module):
+    """ Базовая деталь Лего 2x2. Берет 2 числа, возвращает 2 числа. """
+    def __init__(self):
         super().__init__()
-        self.linear = nn.Linear(embed_dim * 2, embed_dim * 2)
+        self.linear = nn.Linear(2, 2)
 
-    def forward(self, current_token_embed, carrier):
-        combined = torch.cat([current_token_embed, carrier], dim=-1)
+    def forward(self, x1, x2):
+        combined = torch.cat([x1, x2], dim=-1) 
         out = F.relu(self.linear(combined))
-        next_token_pred, next_carrier = torch.chunk(out, 2, dim=-1)
-        return next_token_pred, next_carrier
+        out_a, out_b = torch.chunk(out, 2, dim=-1)
+        return out_a, out_b
 
 
-class LegoLayer(nn.Module):
-    def __init__(self, embed_dim):
+class TrueLegoLayer(nn.Module):
+    def __init__(self, input_width, direction):
         super().__init__()
-        self.block = WideLegoBlock(embed_dim)
-        self.ln = nn.LayerNorm(embed_dim)
+        self.input_width = input_width
+        self.direction = direction
+        self.num_blocks = input_width - 1
+        
+        # Каждый кубик Лего в лесенке имеет СВОИ УНИКАЛЬНЫЕ ВЕСА
+        self.blocks = nn.ModuleList([LegoBlock() for _ in range(self.num_blocks)])
 
     def forward(self, x):
-        B, T, C = x.size()
-        carrier = torch.zeros(B, C, device=x.device)
-        layer_outputs = []
-        for t in range(T):
-            pred, carrier = self.block(x[:, t, :], carrier)
-            layer_outputs.append(pred)
-        h = torch.stack(layer_outputs, dim=1)
-        return self.ln(x + h)
+        batch_size = x.size(0)
+        
+        # Разрезаем входной батч на список тензоров формы [batch_size, 1]
+        channels = list(torch.chunk(x, self.input_width, dim=-1))
+        
+        if self.direction == "backward":
+            # =========================================================
+            # Z-ТОПОЛОГИЯ: Справа налево со смещением на 1 шаг
+            # =========================================================
+            # Стартуем с самого конца вектора (ИСПРАВЛЕНО: берем кубик по индексу [0])
+            out_a, out_b = self.blocks[0](channels[self.input_width - 2], channels[self.input_width - 1])
+            
+            channels[self.input_width - 1] = out_b
+            carrier_signal = out_a 
+            
+            # Шагаем лесенкой влево по остальным кубикам
+            for i in range(1, self.num_blocks):
+                input_idx = (self.input_width - 2) - i 
+                
+                out_a, out_b = self.blocks[i](channels[input_idx], carrier_signal)
+                
+                channels[input_idx + 1] = out_b 
+                carrier_signal = out_a          
+                
+            channels[0] = carrier_signal 
+            
+        else:
+            # =========================================================
+            # FORWARD ТОПОЛОГИЯ: Слева направо со смещением на 1 шаг
+            # =========================================================
+            # Стартуем с начала вектора (ИСПРАВЛЕНО: берем кубик по индексу [0])
+            out_a, out_b = self.blocks[0](channels[0], channels[1])
+            channels[0] = out_a
+            carrier_signal = out_b 
+            
+            for i in range(1, self.num_blocks):
+                input_idx = i + 1
+                out_a, out_b = self.blocks[i](carrier_signal, channels[input_idx])
+                channels[input_idx - 1] = out_a
+                carrier_signal = out_b
+                
+            channels[self.input_width - 1] = carrier_signal
+            
+        # Склеиваем каналы обратно в вектор исходной ширины
+        return torch.cat(channels, dim=-1)
 
 
-class ZDeepLegoGPT(nn.Module):
-    def __init__(self, vocab_size, embed_dim, num_layers):
+class LegoTimeSeriesNet(nn.Module):
+    def __init__(self, input_width, direction="backward"):
         super().__init__()
-        self.embed_dim = embed_dim
-        self.embedding = nn.Embedding(vocab_size, embed_dim)
-        self.layers = nn.ModuleList([LegoLayer(embed_dim) for _ in range(num_layers)])
-        self.classifier = nn.Linear(embed_dim, vocab_size)
+        self.lego_layer = TrueLegoLayer(input_width, direction)
+        self.regressor = nn.Linear(input_width, 1)
 
     def forward(self, x):
-        h = self.embedding(x)
-        for layer in self.layers:
-            h = layer(h)
-        return self.classifier(h)
-
-    def generate_token(self, input_indices):
-        x = torch.tensor([input_indices], device=self.embedding.weight.device)
-        h = self.embedding(x)
-        for layer in self.layers:
-            h = layer(h)
-        return self.classifier(h[:, -1, :])
+        h = self.lego_layer(x)
+        return self.regressor(h)
 
 
 # =====================================================================
-# 4. ИСПРАВЛЕННОЕ ОБУЧЕНИЕ (ТОЧНЫЙ CAUSAL SHIFT)
+# 3. ЦИКЛ ОБУЧЕНИЯ (HUBER LOSS)
 # =====================================================================
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Используемое устройство: {device}\n")
+print(f"Устройство: {device} | Направление: {DIRECTION.upper()}")
 
-model = ZDeepLegoGPT(vocab_size=VOCAB_SIZE, embed_dim=EMBED_DIM, num_layers=NUM_LAYERS).to(device)
-criterion = nn.CrossEntropyLoss()
+model = LegoTimeSeriesNet(input_width=INPUT_WIDTH, direction=DIRECTION).to(device)
+criterion = nn.HuberLoss(delta=0.5) 
 optimizer = optim.Adam(model.parameters(), lr=START_LR)
-scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=ETA_MIN)
+scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=0.0001)
 
-print(f"--- Запуск BPE-обучения Z-DeepLegoGPT ---")
+print(f"--- Старт обучения истинной Лего-лесенки ---")
 for epoch in range(EPOCHS):
     model.train()
     total_loss, batch_count = 0, 0
-    current_lr = optimizer.param_groups[0]['lr']
+    indices = torch.randperm(X_train.size(0))
     
-    for x_batch, y_batch in get_z_bpe_batches(data_indices, BATCH_SIZE, SEQ_LEN):
-        x_batch, y_batch = x_batch.to(device), y_batch.to(device)
+    for i in range(0, X_train.size(0), BATCH_SIZE):
+        batch_idx = indices[i : i + BATCH_SIZE]
+        if len(batch_idx) < BATCH_SIZE: continue
+            
+        x_batch = X_train[batch_idx].to(device)
+        y_batch = Y_train[batch_idx].to(device)
+        
         optimizer.zero_grad()
+        predictions = model(x_batch)
         
-        logits = model(x_batch) # [B, T, VOCAB_SIZE]
-        
-        # !!! ИСПРАВЛЕННЫЙ ЦЕЛЕВОЙ СДВИГ !!!
-        # Поскольку y_batch уже изначально сдвинут в генераторе батчей на 1 шаг вперед,
-        # мы сравниваем их напрямую «точка-в-точку» без срезов [:-1], выпрямляя в плоскость.
-        loss = criterion(logits.view(-1, VOCAB_SIZE), y_batch.view(-1))
-        
+        loss = criterion(predictions, y_batch)
         loss.backward()
-        nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         
         total_loss += loss.item()
         batch_count += 1
         
     scheduler.step()
-    print(f"Эпоха {epoch+1:02d}/{EPOCHS:02d} | Loss: {total_loss/batch_count:.4f} | LR: {current_lr:.6f}")
+    print(f"Эпоха {epoch+1:02d}/{EPOCHS:02d} | Средний Huber Loss: {total_loss/batch_count:.6f}")
+
+
+# =====================================================================
+# 4. ПРОВЕРКА ТЕСТОВОГО ИНФЕРЕНСА
+# =====================================================================
+model.eval()
+with torch.no_grad():
+    test_x = X_test[0:3].to(device) 
+    test_y = Y_test[0:3].to(device)
+    pred_y = model(test_x)
     
-torch.save(model.state_dict(), MODEL_PATH)
-print("Веса модели успешно сохранены на диск.\n")
-
-
-# =====================================================================
-# 5. ИСПРАВЛЕННАЯ ГЕНЕРАЦИЯ ТЕКСТА (БЕЗ СЛОМАННЫХ БАЙТОВ UTF-8)
-# =====================================================================
-def generate_z_bpe_text(model, seed_text, gen_tokens_len, temperature):
-    model.eval()
-    with torch.no_grad():
-        print(f"\nЗатравка (Будущее для Z-модели): '{seed_text}'")
-        
-        # Кодируем затравку и разворачиваем индексы для Z-прохода
-        seed_ids = tokenizer.encode(seed_text)
-        reversed_seed = seed_ids[::-1]
-        
-        generated_indices = list(reversed_seed)
-        
-        for _ in range(gen_tokens_len):
-            context_indices = generated_indices[-SEQ_LEN:]
-            logits = model.generate_token(context_indices)
-            
-            logits = logits / temperature
-            probs = F.softmax(logits, dim=-1)
-            
-            next_token_idx = torch.multinomial(probs, num_samples=1).item()
-            generated_indices.append(next_token_idx)
-            
-        # !!! ИСПРАВЛЕНИЕ ОБРЫВА ДЕКОДЕРА !!!
-        # Перед тем как скармливать токены BPE-декодеру, мы ОБЯЗАНЫ 
-        # вернуть их в нормальный хронологический порядок. Тогда байты UTF-8 склеятся верно.
-        correct_order_indices = generated_indices[::-1]
-        
-        human_readable_text = tokenizer.decode(correct_order_indices)
-        print(f"Результат Z-BPE-LegoGPT:\n{human_readable_text}\n")
-
-# Тесты корректной генерации
-generate_z_bpe_text(model, seed_text="бизнеса.", gen_tokens_len=GEN_LENGTH, temperature=GEN_TEMPERATURE)
+    print("\n--- Результаты инференса (Прогноз на 1 шаг вперед) ---")
+    for i in range(3):
+        print(f"Пример {i+1} | Входное окно: {[round(n, 2) for n in test_x[i].tolist()]}")
+        print(f"         | Реальное будущее число: {test_y[i, 0].item():.4f}")
+        print(f"         | Прогноз Лего-лесенки:   {pred_y[i, 0].item():.4f}")
+        print("-" * 65)
